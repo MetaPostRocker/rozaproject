@@ -828,11 +828,28 @@ async def edit_meter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- List premises ---
 
+PREMISES_PAGE_SIZE = 10
+
+
 async def mgmt_list_premises_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show all premises."""
+    """Show all premises (first page)."""
     query = update.callback_query
     await query.answer()
 
+    await show_premises_page(query, context, page=0)
+
+
+async def premises_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show premises for a specific page."""
+    query = update.callback_query
+    await query.answer()
+
+    page = int(query.data.split("_")[-1])
+    await show_premises_page(query, context, page)
+
+
+async def show_premises_page(query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+    """Display a specific page of premises."""
     premises = await sheets_service.get_all_premises()
 
     if not premises:
@@ -842,27 +859,69 @@ async def mgmt_list_premises_callback(update: Update, context: ContextTypes.DEFA
         )
         return
 
+    total = len(premises)
+    total_pages = (total + PREMISES_PAGE_SIZE - 1) // PREMISES_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * PREMISES_PAGE_SIZE
+    end_idx = min(start_idx + PREMISES_PAGE_SIZE, total)
+    page_items = premises[start_idx:end_idx]
+
     lines = ["📋 *Помещения:*\n"]
-    for p in premises:
+    for p in page_items:
         pid = p.get("id", "")
         name = p.get("Название", "")
         address = p.get("Адрес", "")
         lines.append(f"🏠 *#{pid}* {name}" + (f"\n   📍 {address}" if address else ""))
 
+    if total_pages > 1:
+        lines.append(f"\n📄 Страница {page + 1} из {total_pages} (всего: {total})")
+
+    # Build pagination keyboard
+    buttons = []
+    nav_row = []
+
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("« Назад", callback_data=f"premises_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Вперёд »", callback_data=f"premises_page_{page + 1}"))
+
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton("« В управление", callback_data="owner_management")])
+
     await query.edit_message_text(
         "\n".join(lines),
-        reply_markup=get_back_keyboard("owner_management"),
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
 
 
 # --- List meters ---
 
+METERS_PAGE_SIZE = 5  # Meters have more info, so fewer per page
+
+
 async def mgmt_list_meters_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show all meters."""
+    """Show all meters (first page)."""
     query = update.callback_query
     await query.answer()
 
+    await show_meters_page(query, context, page=0)
+
+
+async def meters_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show meters for a specific page."""
+    query = update.callback_query
+    await query.answer()
+
+    page = int(query.data.split("_")[-1])
+    await show_meters_page(query, context, page)
+
+
+async def show_meters_page(query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+    """Display a specific page of meters."""
     meters = await sheets_service.get_all_meters()
 
     if not meters:
@@ -872,8 +931,16 @@ async def mgmt_list_meters_callback(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
+    total = len(meters)
+    total_pages = (total + METERS_PAGE_SIZE - 1) // METERS_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * METERS_PAGE_SIZE
+    end_idx = min(start_idx + METERS_PAGE_SIZE, total)
+    page_items = meters[start_idx:end_idx]
+
     lines = ["📋 *Счётчики:*\n"]
-    for m in meters:
+    for m in page_items:
         mid = m.get("id", "")
         name = m.get("Название", "")
         premise = m.get("Помещение", "")
@@ -888,9 +955,26 @@ async def mgmt_list_meters_callback(update: Update, context: ContextTypes.DEFAUL
             lines.append(f"   💰 К оплате: {to_pay:.0f} руб.")
         lines.append("")
 
+    if total_pages > 1:
+        lines.append(f"📄 Страница {page + 1} из {total_pages} (всего: {total})")
+
+    # Build pagination keyboard
+    buttons = []
+    nav_row = []
+
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("« Назад", callback_data=f"meters_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Вперёд »", callback_data=f"meters_page_{page + 1}"))
+
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton("« В управление", callback_data="owner_management")])
+
     await query.edit_message_text(
         "\n".join(lines),
-        reply_markup=get_back_keyboard("owner_management"),
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
 
@@ -1069,7 +1153,9 @@ def register_owner_handlers(app: Application) -> None:
     # Management submenu
     app.add_handler(CallbackQueryHandler(owner_management_callback, pattern="^owner_management$"))
     app.add_handler(CallbackQueryHandler(mgmt_list_premises_callback, pattern="^mgmt_list_premises$"))
+    app.add_handler(CallbackQueryHandler(premises_page_callback, pattern=r"^premises_page_\d+$"))
     app.add_handler(CallbackQueryHandler(mgmt_list_meters_callback, pattern="^mgmt_list_meters$"))
+    app.add_handler(CallbackQueryHandler(meters_page_callback, pattern=r"^meters_page_\d+$"))
 
     # Add premise conversation
     add_premise_conv = ConversationHandler(
