@@ -1,3 +1,5 @@
+import logging
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -11,6 +13,8 @@ from telegram.ext import (
 from src.bot.keyboards import get_cancel_keyboard, get_back_keyboard, get_meters_keyboard, get_edit_confirm_keyboard
 from src.services.sheets import sheets_service
 
+logger = logging.getLogger(__name__)
+
 # Conversation states
 ENTERING_READING = 1
 CONFIRMING_READING = 2
@@ -19,11 +23,14 @@ CONFIRMING_READING = 2
 async def meter_selected_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle meter selection for readings."""
     query = update.callback_query
+    logger.info(f"meter_selected_callback called with data: {query.data}")
     await query.answer()
 
     # Extract meter_id from callback_data: "meter_123"
     meter_id = int(query.data.split("_")[1])
+    logger.info(f"Getting meter {meter_id} from sheets...")
     meter = await sheets_service.get_meter(meter_id)
+    logger.info(f"Got meter: {meter}")
 
     if not meter:
         await query.edit_message_text("❌ Счётчик не найден.")
