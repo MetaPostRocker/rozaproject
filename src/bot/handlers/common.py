@@ -1,4 +1,4 @@
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from src.bot.keyboards import (
@@ -217,10 +217,16 @@ async def handle_my_meters_menu(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+READINGS_STATUS_PAGE_SIZE = 10
+
+
 async def handle_owner_readings_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show readings status (from reply keyboard)."""
-    from src.bot.handlers.owner import owner_readings_status_callback
-    # Create a fake callback query context
+    """Show readings status (from reply keyboard) - first page."""
+    await show_readings_status_message(update, context, page=0)
+
+
+async def show_readings_status_message(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+    """Display a specific page of readings status (for reply keyboard handler)."""
     status_list = await sheets_service.get_readings_status()
 
     if not status_list:
@@ -230,12 +236,20 @@ async def handle_owner_readings_status(update: Update, context: ContextTypes.DEF
         )
         return
 
+    total = len(status_list)
+    submitted = sum(1 for item in status_list if item["has_readings"])
+
+    # Pagination
+    total_pages = (total + READINGS_STATUS_PAGE_SIZE - 1) // READINGS_STATUS_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * READINGS_STATUS_PAGE_SIZE
+    end_idx = min(start_idx + READINGS_STATUS_PAGE_SIZE, total)
+    page_items = status_list[start_idx:end_idx]
+
     lines = ["📊 *Статус показаний за текущий месяц:*\n"]
 
-    submitted = 0
-    total = len(status_list)
-
-    for item in status_list:
+    for item in page_items:
         meter = item["meter"]
         name = meter.get("Название", "")
         premise = meter.get("Помещение", "")
@@ -243,7 +257,6 @@ async def handle_owner_readings_status(update: Update, context: ContextTypes.DEF
 
         if item["has_readings"]:
             emoji = "✅"
-            submitted += 1
         else:
             emoji = "⏳"
 
@@ -251,9 +264,26 @@ async def handle_owner_readings_status(update: Update, context: ContextTypes.DEF
 
     lines.append(f"\n📈 *Сдано: {submitted} из {total}*")
 
+    if total_pages > 1:
+        lines.append(f"📄 Страница {page + 1} из {total_pages}")
+
+    # Build pagination keyboard
+    buttons = []
+    nav_row = []
+
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("« Назад", callback_data=f"readings_status_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Вперёд »", callback_data=f"readings_status_page_{page + 1}"))
+
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton("« В меню", callback_data="owner_back_main")])
+
     await update.message.reply_text(
         "\n".join(lines),
-        reply_markup=get_back_keyboard("owner_back_main"),
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
 
