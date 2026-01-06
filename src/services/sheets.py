@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime
 from functools import partial
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -12,16 +13,49 @@ from src.config import settings
 
 
 class SheetsService:
-    """Service for interacting with Google Sheets."""
+    """Service for interacting with Google Sheets.
+
+    Includes in-memory cache with TTL to reduce API calls.
+    """
 
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
 
+    # Cache TTL in seconds (2 minutes for reads)
+    CACHE_TTL = 120
+
     def __init__(self):
         self._client: Optional[gspread.Client] = None
         self._spreadsheet: Optional[gspread.Spreadsheet] = None
+        self._cache: Dict[str, Dict[str, Any]] = {}
+
+    def _get_cached(self, key: str) -> Optional[Any]:
+        """Get value from cache if not expired."""
+        if key in self._cache:
+            entry = self._cache[key]
+            if time.time() - entry["time"] < self.CACHE_TTL:
+                return entry["data"]
+            del self._cache[key]
+        return None
+
+    def _set_cached(self, key: str, data: Any) -> None:
+        """Set value in cache with current timestamp."""
+        self._cache[key] = {"data": data, "time": time.time()}
+
+    def invalidate_cache(self, pattern: Optional[str] = None) -> None:
+        """Invalidate cache entries.
+
+        If pattern is provided, only keys containing the pattern are removed.
+        Otherwise, all cache is cleared.
+        """
+        if pattern is None:
+            self._cache.clear()
+        else:
+            keys_to_delete = [k for k in self._cache if pattern in k]
+            for k in keys_to_delete:
+                del self._cache[k]
 
     def _get_client(self) -> gspread.Client:
         if self._client is None:
@@ -56,22 +90,26 @@ class SheetsService:
     # ============================================================
 
     async def get_all_premises(self) -> List[Dict]:
-        """Get all premises."""
+        """Get all premises (cached)."""
+        cached = self._get_cached("premises")
+        if cached is not None:
+            return cached
+
         def _get():
             sheet = self._get_spreadsheet().worksheet("Помещения")
             return sheet.get_all_records()
-        return await self._run_sync(_get)
+
+        result = await self._run_sync(_get)
+        self._set_cached("premises", result)
+        return result
 
     async def get_premise(self, premise_id: int) -> Optional[Dict]:
-        """Get premise by id."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Помещения")
-            records = sheet.get_all_records()
-            for record in records:
-                if str(record.get("id")) == str(premise_id):
-                    return record
-            return None
-        return await self._run_sync(_get)
+        """Get premise by id (uses cached premises)."""
+        premises = await self.get_all_premises()
+        for record in premises:
+            if str(record.get("id")) == str(premise_id):
+                return record
+        return None
 
     async def add_premise(self, name: str, address: str = "") -> int:
         """Add new premise. Returns new id."""
@@ -81,49 +119,59 @@ class SheetsService:
             new_id = max([r.get("id", 0) for r in records], default=0) + 1
             sheet.append_row([new_id, name, address])
             return new_id
-        return await self._run_sync(_add)
+
+        result = await self._run_sync(_add)
+        self.invalidate_cache("premises")
+        return result
 
     # ============================================================
     # Арендаторы
     # Columns: telegram_id, Имя, Телефон, is_owner
     # ============================================================
 
-    async def get_tenant(self, telegram_id: int) -> Optional[Dict]:
-        """Get tenant by telegram_id."""
+    async def _get_all_tenants_raw(self) -> List[Dict]:
+        """Get all tenants including owner (cached)."""
+        cached = self._get_cached("tenants_raw")
+        if cached is not None:
+            return cached
+
         def _get():
             sheet = self._get_spreadsheet().worksheet("Арендаторы")
-            records = sheet.get_all_records()
-            for record in records:
-                if str(record.get("telegram_id")) == str(telegram_id):
-                    return record
-            return None
-        return await self._run_sync(_get)
+            return sheet.get_all_records()
+
+        result = await self._run_sync(_get)
+        self._set_cached("tenants_raw", result)
+        return result
+
+    async def get_tenant(self, telegram_id: int) -> Optional[Dict]:
+        """Get tenant by telegram_id (uses cached tenants)."""
+        tenants = await self._get_all_tenants_raw()
+        for record in tenants:
+            if str(record.get("telegram_id")) == str(telegram_id):
+                return record
+        return None
 
     async def get_all_tenants(self) -> List[Dict]:
-        """Get all tenants (excluding owner)."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Арендаторы")
-            records = sheet.get_all_records()
-            return [r for r in records if not self._is_true(r.get("is_owner"))]
-        return await self._run_sync(_get)
+        """Get all tenants excluding owner (uses cached tenants)."""
+        tenants = await self._get_all_tenants_raw()
+        return [r for r in tenants if not self._is_true(r.get("is_owner"))]
 
     async def get_owner(self) -> Optional[Dict]:
-        """Get owner record."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Арендаторы")
-            records = sheet.get_all_records()
-            for record in records:
-                if self._is_true(record.get("is_owner")):
-                    return record
-            return None
-        return await self._run_sync(_get)
+        """Get owner record (uses cached tenants)."""
+        tenants = await self._get_all_tenants_raw()
+        for record in tenants:
+            if self._is_true(record.get("is_owner")):
+                return record
+        return None
 
     async def add_tenant(self, telegram_id: int, name: str, phone: str = "") -> None:
         """Add new tenant."""
         def _add():
             sheet = self._get_spreadsheet().worksheet("Арендаторы")
             sheet.append_row([telegram_id, name, phone, "FALSE"])
-        return await self._run_sync(_add)
+
+        await self._run_sync(_add)
+        self.invalidate_cache("tenants")
 
     # ============================================================
     # Счетчики
@@ -136,52 +184,47 @@ class SheetsService:
     # ============================================================
 
     async def get_all_meters(self) -> List[Dict]:
-        """Get all meters."""
+        """Get all meters (cached)."""
+        cached = self._get_cached("meters")
+        if cached is not None:
+            return cached
+
         def _get():
             sheet = self._get_spreadsheet().worksheet("Счетчики")
             return sheet.get_all_records()
-        return await self._run_sync(_get)
+
+        result = await self._run_sync(_get)
+        self._set_cached("meters", result)
+        return result
 
     async def get_meter(self, meter_id: int) -> Optional[Dict]:
-        """Get meter by id."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Счетчики")
-            records = sheet.get_all_records()
-            for record in records:
-                if str(record.get("id")) == str(meter_id):
-                    return record
-            return None
-        return await self._run_sync(_get)
+        """Get meter by id (uses cached meters)."""
+        meters = await self.get_all_meters()
+        for record in meters:
+            if str(record.get("id")) == str(meter_id):
+                return record
+        return None
 
     async def get_meters_for_readings(self, telegram_id: int) -> List[Dict]:
-        """Get meters where user is responsible for readings."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Счетчики")
-            records = sheet.get_all_records()
-            return [
-                r for r in records
-                if str(r.get("ответственный_показания")) == str(telegram_id)
-            ]
-        return await self._run_sync(_get)
+        """Get meters where user is responsible for readings (uses cached meters)."""
+        meters = await self.get_all_meters()
+        return [
+            r for r in meters
+            if str(r.get("ответственный_показания")) == str(telegram_id)
+        ]
 
     async def get_meters_for_payment(self, telegram_id: int) -> List[Dict]:
-        """Get meters where user is responsible for payment."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Счетчики")
-            records = sheet.get_all_records()
-            return [
-                r for r in records
-                if str(r.get("ответственный_оплата")) == str(telegram_id)
-            ]
-        return await self._run_sync(_get)
+        """Get meters where user is responsible for payment (uses cached meters)."""
+        meters = await self.get_all_meters()
+        return [
+            r for r in meters
+            if str(r.get("ответственный_оплата")) == str(telegram_id)
+        ]
 
     async def get_meters_by_premise(self, premise_id: int) -> List[Dict]:
-        """Get all meters for a premise."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Счетчики")
-            records = sheet.get_all_records()
-            return [r for r in records if str(r.get("помещение_id")) == str(premise_id)]
-        return await self._run_sync(_get)
+        """Get all meters for a premise (uses cached meters)."""
+        meters = await self.get_all_meters()
+        return [r for r in meters if str(r.get("помещение_id")) == str(premise_id)]
 
     async def add_meter(
         self,
@@ -233,7 +276,10 @@ class SheetsService:
                 # Columns 16-17 (Расход к оплате, Сумма к оплате) - formulas will auto-fill
             ])
             return new_id
-        return await self._run_sync(_add)
+
+        result = await self._run_sync(_add)
+        self.invalidate_cache("meters")
+        return result
 
     async def update_meter_last_reading(self, meter_id: int, reading: float) -> None:
         """Update last reading and date for a meter.
@@ -248,11 +294,12 @@ class SheetsService:
                 if str(record.get("id")) == str(meter_id):
                     # Column L = Последнее показание (12)
                     # Column M = Дата посл. показания (13)
-                    sheet.update_cell(i, 12, reading)
-                    sheet.update_cell(i, 13, datetime.now().strftime("%Y-%m-%d"))
-                    # Columns 16-17 (Расход к оплате, Сумма к оплате) are formulas - don't touch
+                    # Batch update (1 API call instead of 2)
+                    sheet.update(f"L{i}:M{i}", [[reading, datetime.now().strftime("%Y-%m-%d")]])
                     break
-        return await self._run_sync(_update)
+
+        await self._run_sync(_update)
+        self.invalidate_cache("meters")
 
     async def update_meter_paid_reading(self, meter_id: int) -> Dict:
         """Mark current reading as paid. Returns meter info with payment amount.
@@ -267,7 +314,6 @@ class SheetsService:
             for i, record in enumerate(records, start=2):
                 if str(record.get("id")) == str(meter_id):
                     last_reading = record.get("Последнее показание", 0) or 0
-                    paid_reading = record.get("Оплаченное показание", 0) or 0
 
                     # Read current values from formula columns (for return info)
                     consumption = record.get("Расход к оплате", 0) or 0
@@ -275,9 +321,8 @@ class SheetsService:
 
                     # Column N = Оплаченное показание (14)
                     # Column O = Дата посл. оплаты (15)
-                    sheet.update_cell(i, 14, last_reading)
-                    sheet.update_cell(i, 15, datetime.now().strftime("%Y-%m-%d"))
-                    # Columns 16-17 (Расход к оплате, Сумма к оплате) are formulas - don't touch
+                    # Batch update (1 API call instead of 2)
+                    sheet.update(f"N{i}:O{i}", [[last_reading, datetime.now().strftime("%Y-%m-%d")]])
 
                     return {
                         "meter": record,
@@ -285,7 +330,10 @@ class SheetsService:
                         "amount": amount,
                     }
             return None
-        return await self._run_sync(_update)
+
+        result = await self._run_sync(_update)
+        self.invalidate_cache("meters")
+        return result
 
     # ============================================================
     # Показания
@@ -293,19 +341,30 @@ class SheetsService:
     #          telegram_id, Имя, Показание
     # ============================================================
 
-    async def get_last_reading_for_meter(self, meter_id: int) -> Optional[Dict]:
-        """Get last reading for a specific meter."""
+    async def _get_all_readings(self) -> List[Dict]:
+        """Get all readings (cached)."""
+        cached = self._get_cached("readings")
+        if cached is not None:
+            return cached
+
         def _get():
             sheet = self._get_spreadsheet().worksheet("Показания")
-            records = sheet.get_all_records()
-            matching = [
-                r for r in records
-                if str(r.get("счетчик_id")) == str(meter_id)
-            ]
-            if matching:
-                return matching[-1]
-            return None
-        return await self._run_sync(_get)
+            return sheet.get_all_records()
+
+        result = await self._run_sync(_get)
+        self._set_cached("readings", result)
+        return result
+
+    async def get_last_reading_for_meter(self, meter_id: int) -> Optional[Dict]:
+        """Get last reading for a specific meter (uses cached readings)."""
+        all_readings = await self._get_all_readings()
+        matching = [
+            r for r in all_readings
+            if str(r.get("счетчик_id")) == str(meter_id)
+        ]
+        if matching:
+            return matching[-1]
+        return None
 
     async def save_reading(
         self,
@@ -336,31 +395,23 @@ class SheetsService:
         # Save to log
         result = await self._run_sync(_save)
 
+        # Invalidate readings cache
+        self.invalidate_cache("readings")
+
         # Update meter's last reading
         await self.update_meter_last_reading(meter_id, reading)
 
         return result
 
     async def get_readings_for_meter(self, meter_id: int) -> List[Dict]:
-        """Get all readings for a meter."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Показания")
-            records = sheet.get_all_records()
-            return [r for r in records if str(r.get("счетчик_id")) == str(meter_id)]
-        return await self._run_sync(_get)
+        """Get all readings for a meter (uses cached readings)."""
+        all_readings = await self._get_all_readings()
+        return [r for r in all_readings if str(r.get("счетчик_id")) == str(meter_id)]
 
     async def get_current_month_readings_for_meter(self, meter_id: int) -> List[Dict]:
-        """Get readings for current month for a meter."""
-        current_month = datetime.now().strftime("%Y-%m")
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Показания")
-            records = sheet.get_all_records()
-            return [
-                r for r in records
-                if str(r.get("счетчик_id")) == str(meter_id)
-                and str(r.get("Дата", "")).startswith(current_month)
-            ]
-        return await self._run_sync(_get)
+        """Get readings for current month for a meter (uses cached readings)."""
+        readings_map = await self._get_current_month_meter_readings_map()
+        return readings_map.get(str(meter_id), [])
 
     # ============================================================
     # Счета (актуальный долг по помещению)
@@ -369,30 +420,40 @@ class SheetsService:
     #          H=need_push, I=Дата последней оплаты, J=Выставить (чекбокс)
     # ============================================================
 
-    async def get_invoice_for_premise(self, premise_id: int) -> Optional[Dict]:
-        """Get current invoice for a premise."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Счета")
-            records = sheet.get_all_records()
-            for i, record in enumerate(records, start=2):
-                if str(record.get("помещение_id")) == str(premise_id):
-                    record["_row"] = i
-                    return record
-            return None
-        return await self._run_sync(_get)
+    async def _get_all_invoices(self) -> List[Dict]:
+        """Get all invoices with row numbers (cached)."""
+        cached = self._get_cached("invoices")
+        if cached is not None:
+            return cached
 
-    async def get_invoices_for_tenant(self, telegram_id: int) -> List[Dict]:
-        """Get all invoices where tenant is responsible for payment."""
         def _get():
             sheet = self._get_spreadsheet().worksheet("Счета")
             records = sheet.get_all_records()
             result = []
             for i, record in enumerate(records, start=2):
-                if str(record.get("ответственный_оплата")) == str(telegram_id):
-                    record["_row"] = i
-                    result.append(record)
+                record["_row"] = i
+                result.append(record)
             return result
-        return await self._run_sync(_get)
+
+        result = await self._run_sync(_get)
+        self._set_cached("invoices", result)
+        return result
+
+    async def get_invoice_for_premise(self, premise_id: int) -> Optional[Dict]:
+        """Get current invoice for a premise (uses cached invoices)."""
+        invoices = await self._get_all_invoices()
+        for record in invoices:
+            if str(record.get("помещение_id")) == str(premise_id):
+                return record
+        return None
+
+    async def get_invoices_for_tenant(self, telegram_id: int) -> List[Dict]:
+        """Get all invoices where tenant is responsible for payment (uses cached invoices)."""
+        invoices = await self._get_all_invoices()
+        return [
+            r for r in invoices
+            if str(r.get("ответственный_оплата")) == str(telegram_id)
+        ]
 
     async def get_unpaid_invoices_for_tenant(self, telegram_id: int) -> List[Dict]:
         """Get unpaid invoices for a tenant (only with status 'Не оплачен')."""
@@ -403,30 +464,20 @@ class SheetsService:
         ]
 
     async def get_all_unpaid_invoices(self) -> List[Dict]:
-        """Get all invoices with status 'Не оплачен'."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Счета")
-            records = sheet.get_all_records()
-            result = []
-            for i, record in enumerate(records, start=2):
-                if record.get("Статус") == "Не оплачен" and (record.get("Сумма", 0) or 0) > 0:
-                    record["_row"] = i
-                    result.append(record)
-            return result
-        return await self._run_sync(_get)
+        """Get all invoices with status 'Не оплачен' (uses cached invoices)."""
+        invoices = await self._get_all_invoices()
+        return [
+            r for r in invoices
+            if r.get("Статус") == "Не оплачен" and (r.get("Сумма", 0) or 0) > 0
+        ]
 
     async def get_draft_invoices(self) -> List[Dict]:
-        """Get all invoices with status 'Черновик' (ready to be issued)."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Счета")
-            records = sheet.get_all_records()
-            result = []
-            for i, record in enumerate(records, start=2):
-                if record.get("Статус") == "Черновик" and (record.get("Сумма", 0) or 0) > 0:
-                    record["_row"] = i
-                    result.append(record)
-            return result
-        return await self._run_sync(_get)
+        """Get all invoices with status 'Черновик' (uses cached invoices)."""
+        invoices = await self._get_all_invoices()
+        return [
+            r for r in invoices
+            if r.get("Статус") == "Черновик" and (r.get("Сумма", 0) or 0) > 0
+        ]
 
     async def issue_invoice(self, premise_id: int) -> bool:
         """Issue invoice: copy Сумма to Выставленная сумма.
@@ -440,13 +491,14 @@ class SheetsService:
             for i, record in enumerate(records, start=2):
                 if str(record.get("помещение_id")) == str(premise_id):
                     current_amount = record.get("Сумма", 0) or 0
-                    # Column F = Выставленная сумма (6) - copy current amount
                     sheet.update_cell(i, 6, current_amount)
-                    # Column H = need_push (8) - NOT set here, notification sent by bot
-                    # Статус (G) is a formula, will auto-update to "Не оплачен"
                     return True
             return False
-        return await self._run_sync(_issue)
+
+        result = await self._run_sync(_issue)
+        if result:
+            self.invalidate_cache("invoices")
+        return result
 
     async def update_invoice_amount(self, premise_id: int) -> None:
         """Recalculate invoice amount from meters for a premise."""
@@ -475,13 +527,11 @@ class SheetsService:
             found = False
             for i, record in enumerate(records, start=2):
                 if str(record.get("помещение_id")) == str(premise_id):
-                    # Update existing: Column E = Сумма (5)
                     invoices_sheet.update_cell(i, 5, total)
                     found = True
                     break
 
             if not found and total > 0:
-                # Create new invoice row
                 invoices_sheet.append_row([
                     premise_id,
                     premise_name,
@@ -492,7 +542,8 @@ class SheetsService:
                     "",
                 ])
 
-        return await self._run_sync(_update)
+        await self._run_sync(_update)
+        self.invalidate_cache("invoices")
 
     async def mark_invoice_paid(self, premise_id: int) -> None:
         """Mark invoice as paid: zero out Выставленная сумма, update date."""
@@ -503,26 +554,23 @@ class SheetsService:
                 if str(record.get("помещение_id")) == str(premise_id):
                     # Column F = Выставленная сумма (6) - set to 0
                     # Column I = Дата последней оплаты (9)
-                    # Статус (G) is a formula, will auto-update to "Оплачено"
-                    # НЕ трогаем Column E = Сумма (там формула)
-                    sheet.update_cell(i, 6, 0)
-                    sheet.update_cell(i, 9, datetime.now().strftime("%Y-%m-%d"))
+                    # Batch update (1 API call instead of 2)
+                    sheet.update(f"F{i}", [[0]])
+                    sheet.update(f"I{i}", [[datetime.now().strftime("%Y-%m-%d")]])
                     break
-        return await self._run_sync(_mark)
+
+        await self._run_sync(_mark)
+        self.invalidate_cache("invoices")
 
     async def get_invoices_needing_push(self) -> List[Dict]:
-        """Get all invoices where need_push = 1."""
-        def _get():
-            sheet = self._get_spreadsheet().worksheet("Счета")
-            records = sheet.get_all_records()
-            result = []
-            for i, record in enumerate(records, start=2):
-                need_push = record.get("need_push", 0)
-                if need_push == 1 or need_push == "1" or need_push is True:
-                    record["_row"] = i
-                    result.append(record)
-            return result
-        return await self._run_sync(_get)
+        """Get all invoices where need_push = 1 (uses cached invoices)."""
+        invoices = await self._get_all_invoices()
+        result = []
+        for record in invoices:
+            need_push = record.get("need_push", 0)
+            if need_push == 1 or need_push == "1" or need_push is True:
+                result.append(record)
+        return result
 
     async def clear_need_push(self, premise_id: int) -> None:
         """Clear need_push flag after sending notification."""
@@ -531,10 +579,11 @@ class SheetsService:
             records = sheet.get_all_records()
             for i, record in enumerate(records, start=2):
                 if str(record.get("помещение_id")) == str(premise_id):
-                    # Column H = need_push (8) - set to 0
                     sheet.update_cell(i, 8, 0)
                     break
-        return await self._run_sync(_clear)
+
+        await self._run_sync(_clear)
+        self.invalidate_cache("invoices")
 
     # ============================================================
     # Оплаты (лог)
@@ -604,26 +653,36 @@ class SheetsService:
     # Columns: Ключ, Значение
     # ============================================================
 
-    async def get_setting(self, key: str) -> Optional[str]:
-        """Get setting value by key."""
+    async def _get_all_settings(self) -> Dict[str, str]:
+        """Get all settings as a dict (cached)."""
+        cached = self._get_cached("settings")
+        if cached is not None:
+            return cached
+
         def _get():
             sheet = self._get_spreadsheet().worksheet("Настройки")
             records = sheet.get_all_records()
-            for record in records:
-                if record.get("Ключ") == key:
-                    return record.get("Значение")
-            return None
-        return await self._run_sync(_get)
+            return {r.get("Ключ"): r.get("Значение") for r in records if r.get("Ключ")}
+
+        result = await self._run_sync(_get)
+        self._set_cached("settings", result)
+        return result
+
+    async def get_setting(self, key: str) -> Optional[str]:
+        """Get setting value by key (uses cached settings)."""
+        settings_dict = await self._get_all_settings()
+        return settings_dict.get(key)
 
     async def get_payment_details(self) -> str:
-        """Get payment details from settings."""
+        """Get payment details from settings (uses cached settings)."""
         details = await self.get_setting("payment_details")
         return details or "Реквизиты не указаны"
 
     async def get_readings_period(self) -> tuple:
-        """Get readings reminder period (start_day, end_day)."""
-        start = await self.get_setting("readings_start_day")
-        end = await self.get_setting("readings_end_day")
+        """Get readings reminder period (start_day, end_day). Uses cached settings."""
+        settings_dict = await self._get_all_settings()
+        start = settings_dict.get("readings_start_day")
+        end = settings_dict.get("readings_end_day")
         return (int(start) if start else 15, int(end) if end else 20)
 
     # ============================================================
@@ -632,7 +691,11 @@ class SheetsService:
     # ============================================================
 
     async def get_tariffs(self) -> List[Dict]:
-        """Get all tariffs from Тарифы sheet."""
+        """Get all tariffs from Тарифы sheet (cached)."""
+        cached = self._get_cached("tariffs")
+        if cached is not None:
+            return cached
+
         def _get():
             sheet = self._get_spreadsheet().worksheet("Тарифы")
             records = sheet.get_all_records()
@@ -644,10 +707,13 @@ class SheetsService:
                     "Тариф": record.get("Тариф", 0) or 0,
                 })
             return result
-        return await self._run_sync(_get)
+
+        result = await self._run_sync(_get)
+        self._set_cached("tariffs", result)
+        return result
 
     async def get_tariff_by_type(self, tariff_type: str) -> Optional[Dict]:
-        """Get tariff by type name."""
+        """Get tariff by type name (uses cached tariffs)."""
         tariffs = await self.get_tariffs()
         for t in tariffs:
             if t.get("Тип") == tariff_type:
@@ -661,52 +727,53 @@ class SheetsService:
             records = sheet.get_all_records()
             for i, record in enumerate(records, start=2):
                 if record.get("Тип") == tariff_type:
-                    # Column B = Тариф (2)
                     sheet.update_cell(i, 2, new_value)
                     return True
             return False
-        return await self._run_sync(_update)
+
+        result = await self._run_sync(_update)
+        if result:
+            self.invalidate_cache("tariffs")
+        return result
 
     # ============================================================
     # Агрегация для статусов
     # ============================================================
 
+    async def _get_current_month_meter_readings_map(self) -> Dict[str, List[Dict]]:
+        """Get map of meter_id -> readings for current month (cached).
+
+        Used by both get_readings_status and get_tenants_without_readings
+        to avoid duplicate API calls.
+        """
+        cache_key = f"readings_map_{datetime.now().strftime('%Y-%m')}"
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            return cached
+
+        all_readings = await self._get_all_readings()
+        current_month = datetime.now().strftime("%Y-%m")
+
+        # Group readings by meter_id for current month
+        readings_by_meter: Dict[str, List[Dict]] = {}
+        for r in all_readings:
+            if str(r.get("Дата", "")).startswith(current_month):
+                meter_id = str(r.get("счетчик_id", ""))
+                if meter_id not in readings_by_meter:
+                    readings_by_meter[meter_id] = []
+                readings_by_meter[meter_id].append(r)
+
+        self._set_cached(cache_key, readings_by_meter)
+        return readings_by_meter
+
     async def get_readings_status(self) -> List[Dict]:
         """Get readings status for all meters (who submitted this month).
 
-        Optimized: loads all data in 2 requests instead of N+1.
+        Fully cached: uses cached meters and cached readings map.
         """
-        def _get():
-            spreadsheet = self._get_spreadsheet()
+        meters = await self.get_all_meters()
+        readings_by_meter = await self._get_current_month_meter_readings_map()
 
-            # Load all meters (1 request)
-            meters_sheet = spreadsheet.worksheet("Счетчики")
-            meters = meters_sheet.get_all_records()
-
-            # Load all readings (1 request)
-            readings_sheet = spreadsheet.worksheet("Показания")
-            all_readings = readings_sheet.get_all_records()
-
-            return meters, all_readings
-
-        meters, all_readings = await self._run_sync(_get)
-        current_month = datetime.now().strftime("%Y-%m")
-
-        # Filter readings for current month in memory
-        current_month_readings = [
-            r for r in all_readings
-            if str(r.get("Дата", "")).startswith(current_month)
-        ]
-
-        # Group readings by meter_id
-        readings_by_meter = {}
-        for r in current_month_readings:
-            meter_id = str(r.get("счетчик_id", ""))
-            if meter_id not in readings_by_meter:
-                readings_by_meter[meter_id] = []
-            readings_by_meter[meter_id].append(r)
-
-        # Build result
         result = []
         for meter in meters:
             meter_id = str(meter.get("id", ""))
@@ -721,35 +788,16 @@ class SheetsService:
     async def get_tenants_without_readings(self) -> List[Dict]:
         """Get list of tenants who haven't submitted readings this month.
 
-        Optimized: loads all data in 2 requests instead of N+1.
+        Fully cached: uses cached meters and cached readings map.
         """
-        def _get():
-            spreadsheet = self._get_spreadsheet()
-
-            # Load all meters (1 request)
-            meters_sheet = spreadsheet.worksheet("Счетчики")
-            meters = meters_sheet.get_all_records()
-
-            # Load all readings (1 request)
-            readings_sheet = spreadsheet.worksheet("Показания")
-            all_readings = readings_sheet.get_all_records()
-
-            return meters, all_readings
-
-        meters, all_readings = await self._run_sync(_get)
-        current_month = datetime.now().strftime("%Y-%m")
-
-        # Get meter IDs that have readings this month
-        meters_with_readings = set()
-        for r in all_readings:
-            if str(r.get("Дата", "")).startswith(current_month):
-                meters_with_readings.add(str(r.get("счетчик_id", "")))
+        meters = await self.get_all_meters()
+        readings_by_meter = await self._get_current_month_meter_readings_map()
 
         # Find tenants with meters without readings
         tenants_to_remind = {}
         for meter in meters:
             meter_id = str(meter.get("id", ""))
-            if meter_id not in meters_with_readings:
+            if meter_id not in readings_by_meter:
                 tid = meter.get("ответственный_показания")
                 if tid and tid not in tenants_to_remind:
                     tenants_to_remind[tid] = {

@@ -403,8 +403,16 @@ async def send_reminder_to_one(
             reply_markup=get_back_keyboard("owner_reminders")
         )
     except Exception as e:
+        error_str = str(e).lower()
+        if "chat not found" in error_str or "bot was blocked" in error_str:
+            error_msg = "Пользователь не запустил бота или заблокировал его."
+        elif "user is deactivated" in error_str:
+            error_msg = "Аккаунт пользователя удалён."
+        else:
+            error_msg = str(e)
+
         await query.edit_message_text(
-            f"❌ Не удалось отправить напоминание.\n\nОшибка: {e}",
+            f"❌ Не удалось отправить напоминание.\n\n{error_msg}",
             reply_markup=get_back_keyboard("owner_reminders")
         )
 
