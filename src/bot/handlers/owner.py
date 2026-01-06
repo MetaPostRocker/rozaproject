@@ -1189,6 +1189,7 @@ def register_owner_handlers(app: Application) -> None:
             CallbackQueryHandler(cancel_management_callback, pattern="^cancel$"),
             CallbackQueryHandler(cancel_management_callback, pattern="^owner_back_main$"),
         ],
+        allow_reentry=True,
     )
     app.add_handler(add_premise_conv)
 
@@ -1228,6 +1229,7 @@ def register_owner_handlers(app: Application) -> None:
             CallbackQueryHandler(cancel_management_callback, pattern="^cancel$"),
             CallbackQueryHandler(cancel_management_callback, pattern="^owner_back_main$"),
         ],
+        allow_reentry=True,
     )
     app.add_handler(add_meter_conv)
 
@@ -1252,5 +1254,6 @@ def register_owner_handlers(app: Application) -> None:
             CallbackQueryHandler(cancel_tariff_edit_callback, pattern="^cancel$"),
             CallbackQueryHandler(cancel_tariff_edit_callback, pattern="^mgmt_tariffs$"),
         ],
+        allow_reentry=True,
     )
     app.add_handler(edit_tariff_conv)

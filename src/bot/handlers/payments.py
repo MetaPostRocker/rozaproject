@@ -295,6 +295,7 @@ def register_payment_handlers(app: Application) -> None:
         fallbacks=[
             CallbackQueryHandler(cancel_payment_callback, pattern="^cancel$"),
         ],
+        allow_reentry=True,
     )
 
     app.add_handler(payment_conv)
