@@ -628,12 +628,31 @@ class SheetsService:
         1. Mark each meter as paid (update Оплаченное показание in Счетчики)
         2. Save payment log
         3. Update invoice status (NOT the amount - it's a formula)
+
+        Optimized: batch updates all meters in single API call instead of N calls.
         """
-        # Get meters for this premise and mark as paid
-        meters = await self.get_meters_by_premise(premise_id)
-        for meter in meters:
-            meter_id = meter.get("id")
-            await self.update_meter_paid_reading(meter_id)
+        def _mark_meters_paid():
+            sheet = self._get_spreadsheet().worksheet("Счетчики")
+            records = sheet.get_all_records()
+            today = datetime.now().strftime("%Y-%m-%d")
+
+            # Collect all updates for this premise
+            updates = []
+            for i, record in enumerate(records, start=2):
+                if str(record.get("помещение_id")) == str(premise_id):
+                    last_reading = record.get("Последнее показание", 0) or 0
+                    # Column N = Оплаченное показание (14), Column O = Дата посл. оплаты (15)
+                    updates.append({
+                        "range": f"N{i}:O{i}",
+                        "values": [[last_reading, today]]
+                    })
+
+            # Batch update all meters at once
+            if updates:
+                sheet.batch_update(updates)
+
+        await self._run_sync(_mark_meters_paid)
+        self.invalidate_cache("meters")
 
         # Save payment log
         await self.save_payment(
