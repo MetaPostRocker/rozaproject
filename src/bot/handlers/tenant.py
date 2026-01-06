@@ -33,8 +33,7 @@ async def meter_selected_callback(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["selected_meter"] = meter
 
     # Get last reading
-    last_reading = await sheets_service.get_last_reading_for_meter(meter_id)
-    prev_value = last_reading.get("Показание", 0) if last_reading else 0
+    prev_value = meter.get("Последнее показание", 0)
     context.user_data["prev_value"] = prev_value
 
     name = meter.get("Название", "")
