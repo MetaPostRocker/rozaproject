@@ -156,11 +156,11 @@ def setup_scheduler(app: Application) -> None:
         logger.warning("Job queue not available, skipping scheduler setup")
         return
 
-    # Check for invoice push notifications every minute
+    # Check for invoice push notifications every 5 minutes
     job_queue.run_repeating(
         lambda ctx: process_invoice_push_notifications(app),
-        interval=60,  # every 60 seconds
-        first=10,  # start after 10 seconds
+        interval=300,  # every 5 minutes
+        first=30,  # start after 30 seconds
         name="invoice_push_check",
     )
 

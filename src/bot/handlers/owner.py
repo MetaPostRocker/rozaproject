@@ -1,4 +1,4 @@
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -57,11 +57,29 @@ async def owner_back_main_callback(update: Update, context: ContextTypes.DEFAULT
 
 # === Readings status ===
 
+READINGS_STATUS_PAGE_SIZE = 10
+
+
 async def owner_readings_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show readings status for all meters."""
+    """Show readings status for all meters (first page)."""
     query = update.callback_query
     await query.answer()
 
+    await show_readings_status_page(query, context, page=0)
+
+
+async def readings_status_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show readings status for a specific page."""
+    query = update.callback_query
+    await query.answer()
+
+    # Extract page number from callback_data: readings_status_page_N
+    page = int(query.data.split("_")[-1])
+    await show_readings_status_page(query, context, page)
+
+
+async def show_readings_status_page(query, context: ContextTypes.DEFAULT_TYPE, page: int) -> None:
+    """Display a specific page of readings status."""
     status_list = await sheets_service.get_readings_status()
 
     if not status_list:
@@ -71,12 +89,20 @@ async def owner_readings_status_callback(update: Update, context: ContextTypes.D
         )
         return
 
-    lines = ["📊 *Статус показаний за текущий месяц:*\n"]
-
-    submitted = 0
     total = len(status_list)
+    submitted = sum(1 for item in status_list if item["has_readings"])
 
-    for item in status_list:
+    # Pagination
+    total_pages = (total + READINGS_STATUS_PAGE_SIZE - 1) // READINGS_STATUS_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * READINGS_STATUS_PAGE_SIZE
+    end_idx = min(start_idx + READINGS_STATUS_PAGE_SIZE, total)
+    page_items = status_list[start_idx:end_idx]
+
+    lines = [f"📊 *Статус показаний за текущий месяц:*\n"]
+
+    for item in page_items:
         meter = item["meter"]
         name = meter.get("Название", "")
         premise = meter.get("Помещение", "")
@@ -84,7 +110,6 @@ async def owner_readings_status_callback(update: Update, context: ContextTypes.D
 
         if item["has_readings"]:
             emoji = "✅"
-            submitted += 1
         else:
             emoji = "⏳"
 
@@ -92,9 +117,26 @@ async def owner_readings_status_callback(update: Update, context: ContextTypes.D
 
     lines.append(f"\n📈 *Сдано: {submitted} из {total}*")
 
+    if total_pages > 1:
+        lines.append(f"📄 Страница {page + 1} из {total_pages}")
+
+    # Build pagination keyboard
+    buttons = []
+    nav_row = []
+
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("« Назад", callback_data=f"readings_status_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Вперёд »", callback_data=f"readings_status_page_{page + 1}"))
+
+    if nav_row:
+        buttons.append(nav_row)
+
+    buttons.append([InlineKeyboardButton("« В меню", callback_data="owner_back_main")])
+
     await query.edit_message_text(
         "\n".join(lines),
-        reply_markup=get_back_keyboard("owner_back_main"),
+        reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="Markdown"
     )
 
@@ -1011,6 +1053,7 @@ def register_owner_handlers(app: Application) -> None:
 
     # Status and info
     app.add_handler(CallbackQueryHandler(owner_readings_status_callback, pattern="^owner_readings_status$"))
+    app.add_handler(CallbackQueryHandler(readings_status_page_callback, pattern=r"^readings_status_page_\d+$"))
     app.add_handler(CallbackQueryHandler(owner_unpaid_callback, pattern="^owner_unpaid$"))
 
     # Issue invoices

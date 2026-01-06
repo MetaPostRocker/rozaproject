@@ -672,29 +672,84 @@ class SheetsService:
     # ============================================================
 
     async def get_readings_status(self) -> List[Dict]:
-        """Get readings status for all meters (who submitted this month)."""
-        meters = await self.get_all_meters()
+        """Get readings status for all meters (who submitted this month).
+
+        Optimized: loads all data in 2 requests instead of N+1.
+        """
+        def _get():
+            spreadsheet = self._get_spreadsheet()
+
+            # Load all meters (1 request)
+            meters_sheet = spreadsheet.worksheet("Счетчики")
+            meters = meters_sheet.get_all_records()
+
+            # Load all readings (1 request)
+            readings_sheet = spreadsheet.worksheet("Показания")
+            all_readings = readings_sheet.get_all_records()
+
+            return meters, all_readings
+
+        meters, all_readings = await self._run_sync(_get)
         current_month = datetime.now().strftime("%Y-%m")
 
+        # Filter readings for current month in memory
+        current_month_readings = [
+            r for r in all_readings
+            if str(r.get("Дата", "")).startswith(current_month)
+        ]
+
+        # Group readings by meter_id
+        readings_by_meter = {}
+        for r in current_month_readings:
+            meter_id = str(r.get("счетчик_id", ""))
+            if meter_id not in readings_by_meter:
+                readings_by_meter[meter_id] = []
+            readings_by_meter[meter_id].append(r)
+
+        # Build result
         result = []
         for meter in meters:
-            readings = await self.get_current_month_readings_for_meter(meter.get("id"))
+            meter_id = str(meter.get("id", ""))
+            meter_readings = readings_by_meter.get(meter_id, [])
             result.append({
                 "meter": meter,
-                "has_readings": len(readings) > 0,
-                "readings_count": len(readings),
+                "has_readings": len(meter_readings) > 0,
+                "readings_count": len(meter_readings),
             })
         return result
 
     async def get_tenants_without_readings(self) -> List[Dict]:
-        """Get list of tenants who haven't submitted readings this month."""
-        meters = await self.get_all_meters()
+        """Get list of tenants who haven't submitted readings this month.
+
+        Optimized: loads all data in 2 requests instead of N+1.
+        """
+        def _get():
+            spreadsheet = self._get_spreadsheet()
+
+            # Load all meters (1 request)
+            meters_sheet = spreadsheet.worksheet("Счетчики")
+            meters = meters_sheet.get_all_records()
+
+            # Load all readings (1 request)
+            readings_sheet = spreadsheet.worksheet("Показания")
+            all_readings = readings_sheet.get_all_records()
+
+            return meters, all_readings
+
+        meters, all_readings = await self._run_sync(_get)
         current_month = datetime.now().strftime("%Y-%m")
 
+        # Get meter IDs that have readings this month
+        meters_with_readings = set()
+        for r in all_readings:
+            if str(r.get("Дата", "")).startswith(current_month):
+                meters_with_readings.add(str(r.get("счетчик_id", "")))
+
+        # Find tenants with meters without readings
         tenants_to_remind = {}
         for meter in meters:
-            readings = await self.get_current_month_readings_for_meter(meter.get("id"))
-            if not readings:
+            meter_id = str(meter.get("id", ""))
+            if meter_id not in meters_with_readings:
                 tid = meter.get("ответственный_показания")
                 if tid and tid not in tenants_to_remind:
                     tenants_to_remind[tid] = {
