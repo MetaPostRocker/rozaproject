@@ -16,6 +16,7 @@ class SheetsService:
     """Service for interacting with Google Sheets.
 
     Includes in-memory cache with TTL to reduce API calls.
+    Column operations use column names instead of indices for flexibility.
     """
 
     SCOPES = [
@@ -25,11 +26,14 @@ class SheetsService:
 
     # Cache TTL in seconds (2 minutes for reads)
     CACHE_TTL = 120
+    # Headers cache TTL (10 minutes - headers change rarely)
+    HEADERS_CACHE_TTL = 600
 
     def __init__(self):
         self._client: Optional[gspread.Client] = None
         self._spreadsheet: Optional[gspread.Spreadsheet] = None
         self._cache: Dict[str, Dict[str, Any]] = {}
+        self._headers_cache: Dict[str, Dict[str, Any]] = {}
 
     def _get_cached(self, key: str) -> Optional[Any]:
         """Get value from cache if not expired."""
@@ -56,6 +60,51 @@ class SheetsService:
             keys_to_delete = [k for k in self._cache if pattern in k]
             for k in keys_to_delete:
                 del self._cache[k]
+
+    def _get_sheet_headers(self, sheet: gspread.Worksheet) -> List[str]:
+        """Get headers (first row) for a sheet with caching.
+
+        Returns list of column names. Indices are 0-based.
+        """
+        sheet_name = sheet.title
+        if sheet_name in self._headers_cache:
+            entry = self._headers_cache[sheet_name]
+            if time.time() - entry["time"] < self.HEADERS_CACHE_TTL:
+                return entry["data"]
+
+        headers = sheet.row_values(1)
+        self._headers_cache[sheet_name] = {"data": headers, "time": time.time()}
+        return headers
+
+    def _get_col_index(self, sheet: gspread.Worksheet, col_name: str) -> int:
+        """Get 1-based column index by column name.
+
+        Raises ValueError if column not found.
+        """
+        headers = self._get_sheet_headers(sheet)
+        try:
+            return headers.index(col_name) + 1  # 1-based for gspread
+        except ValueError:
+            raise ValueError(f"Column '{col_name}' not found in sheet '{sheet.title}'. Available: {headers}")
+
+    def _get_col_letter(self, sheet: gspread.Worksheet, col_name: str) -> str:
+        """Get column letter (A, B, C, ..., AA, AB, ...) by column name."""
+        col_index = self._get_col_index(sheet, col_name)
+        return gspread.utils.rowcol_to_a1(1, col_index)[:-1]  # Remove row number
+
+    def _get_range_by_names(self, sheet: gspread.Worksheet, row: int, col_names: List[str]) -> str:
+        """Get A1 range notation for a row spanning multiple columns by names.
+
+        Example: row=5, col_names=["Последнее показание", "Дата посл. показания"]
+        Returns: "L5:M5" (or whatever columns those are)
+        """
+        if len(col_names) == 1:
+            letter = self._get_col_letter(sheet, col_names[0])
+            return f"{letter}{row}"
+        else:
+            first_letter = self._get_col_letter(sheet, col_names[0])
+            last_letter = self._get_col_letter(sheet, col_names[-1])
+            return f"{first_letter}{row}:{last_letter}{row}"
 
     def _get_client(self) -> gspread.Client:
         if self._client is None:
@@ -284,7 +333,7 @@ class SheetsService:
     async def update_meter_last_reading(self, meter_id: int, reading: float) -> None:
         """Update last reading and date for a meter.
 
-        Note: Columns Расход к оплате (16) and Сумма к оплате (17) are formula-based
+        Note: Columns Расход к оплате and Сумма к оплате are formula-based
         in Google Sheets and recalculate automatically.
         """
         def _update():
@@ -292,10 +341,10 @@ class SheetsService:
             records = sheet.get_all_records()
             for i, record in enumerate(records, start=2):
                 if str(record.get("id")) == str(meter_id):
-                    # Column L = Последнее показание (12)
-                    # Column M = Дата посл. показания (13)
-                    # Batch update (1 API call instead of 2)
-                    sheet.update(f"L{i}:M{i}", [[reading, datetime.now().strftime("%Y-%m-%d")]])
+                    range_addr = self._get_range_by_names(
+                        sheet, i, ["Последнее показание", "Дата посл. показания"]
+                    )
+                    sheet.update(range_addr, [[reading, datetime.now().strftime("%Y-%m-%d")]])
                     break
 
         await self._run_sync(_update)
@@ -304,7 +353,7 @@ class SheetsService:
     async def update_meter_paid_reading(self, meter_id: int) -> Dict:
         """Mark current reading as paid. Returns meter info with payment amount.
 
-        Note: Columns Расход к оплате (16) and Сумма к оплате (17) are formula-based
+        Note: Columns Расход к оплате and Сумма к оплате are formula-based
         in Google Sheets. When Оплаченное показание is updated, formulas will
         automatically recalculate to show 0 (or new consumption).
         """
@@ -319,10 +368,10 @@ class SheetsService:
                     consumption = record.get("Расход к оплате", 0) or 0
                     amount = record.get("Сумма к оплате", 0) or 0
 
-                    # Column N = Оплаченное показание (14)
-                    # Column O = Дата посл. оплаты (15)
-                    # Batch update (1 API call instead of 2)
-                    sheet.update(f"N{i}:O{i}", [[last_reading, datetime.now().strftime("%Y-%m-%d")]])
+                    range_addr = self._get_range_by_names(
+                        sheet, i, ["Оплаченное показание", "Дата посл. оплаты"]
+                    )
+                    sheet.update(range_addr, [[last_reading, datetime.now().strftime("%Y-%m-%d")]])
 
                     return {
                         "meter": record,
@@ -491,7 +540,8 @@ class SheetsService:
             for i, record in enumerate(records, start=2):
                 if str(record.get("помещение_id")) == str(premise_id):
                     current_amount = record.get("Сумма", 0) or 0
-                    sheet.update_cell(i, 6, current_amount)
+                    col_idx = self._get_col_index(sheet, "Выставленная сумма")
+                    sheet.update_cell(i, col_idx, current_amount)
                     return True
             return False
 
@@ -527,7 +577,8 @@ class SheetsService:
             found = False
             for i, record in enumerate(records, start=2):
                 if str(record.get("помещение_id")) == str(premise_id):
-                    invoices_sheet.update_cell(i, 5, total)
+                    col_idx = self._get_col_index(invoices_sheet, "Сумма")
+                    invoices_sheet.update_cell(i, col_idx, total)
                     found = True
                     break
 
@@ -552,11 +603,12 @@ class SheetsService:
             records = sheet.get_all_records()
             for i, record in enumerate(records, start=2):
                 if str(record.get("помещение_id")) == str(premise_id):
-                    # Column F = Выставленная сумма (6) - set to 0
-                    # Column I = Дата последней оплаты (9)
-                    # Batch update (1 API call instead of 2)
-                    sheet.update(f"F{i}", [[0]])
-                    sheet.update(f"I{i}", [[datetime.now().strftime("%Y-%m-%d")]])
+                    # Set Выставленная сумма to 0
+                    range1 = self._get_range_by_names(sheet, i, ["Выставленная сумма"])
+                    sheet.update(range1, [[0]])
+                    # Update Дата последней оплаты
+                    range2 = self._get_range_by_names(sheet, i, ["Дата последней оплаты"])
+                    sheet.update(range2, [[datetime.now().strftime("%Y-%m-%d")]])
                     break
 
         await self._run_sync(_mark)
@@ -579,7 +631,8 @@ class SheetsService:
             records = sheet.get_all_records()
             for i, record in enumerate(records, start=2):
                 if str(record.get("помещение_id")) == str(premise_id):
-                    sheet.update_cell(i, 8, 0)
+                    col_idx = self._get_col_index(sheet, "need_push")
+                    sheet.update_cell(i, col_idx, 0)
                     break
 
         await self._run_sync(_clear)
@@ -641,9 +694,11 @@ class SheetsService:
             for i, record in enumerate(records, start=2):
                 if str(record.get("помещение_id")) == str(premise_id):
                     last_reading = record.get("Последнее показание", 0) or 0
-                    # Column N = Оплаченное показание (14), Column O = Дата посл. оплаты (15)
+                    range_addr = self._get_range_by_names(
+                        sheet, i, ["Оплаченное показание", "Дата посл. оплаты"]
+                    )
                     updates.append({
-                        "range": f"N{i}:O{i}",
+                        "range": range_addr,
                         "values": [[last_reading, today]]
                     })
 
@@ -746,7 +801,8 @@ class SheetsService:
             records = sheet.get_all_records()
             for i, record in enumerate(records, start=2):
                 if record.get("Тип") == tariff_type:
-                    sheet.update_cell(i, 2, new_value)
+                    col_idx = self._get_col_index(sheet, "Тариф")
+                    sheet.update_cell(i, col_idx, new_value)
                     return True
             return False
 
